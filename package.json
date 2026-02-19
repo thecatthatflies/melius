@@ -2,7 +2,7 @@
   "name": "melius",
   "productName": "melius",
   "version": "1.0.0",
-  "description": "My Electron application description",
+  "description": "melius. the better code editor.",
   "main": "src/index.js",
   "private": true,
   "scripts": {
@@ -10,7 +10,7 @@
     "package": "electron-forge package",
     "make": "electron-forge make",
     "publish": "electron-forge publish",
-    "lint": "echo \"No linting configured\""
+    "format": "prettier --write . && eslint --fix ."
   },
   "keywords": [],
   "author": {
@@ -21,12 +21,17 @@
   "dependencies": {
     "@electron/asar": "^4.0.1",
     "@inquirer/editor": "^5.0.7",
-    "@npmcli/move-file": "^3.0.0",
+    "@npmcli/move-file": "^1.0.1",
     "electron-squirrel-startup": "^1.0.1",
-    "external-editor": "^3.1.0",
+    "eslint": "^10.0.0",
+    "external-editor": "^1.1.0",
     "monaco-editor": "^0.55.1",
+    "node-pty": "^1.1.0",
+    "prettier": "^3.8.1",
     "tar": "^7.5.9",
-    "tmp": "^0.2.5"
+    "tmp": "^0.2.5",
+    "xterm": "^5.3.0",
+    "xterm-addon-fit": "^0.8.0"
   },
   "devDependencies": {
     "@electron-forge/cli": "^7.6.1",

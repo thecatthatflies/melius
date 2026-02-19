@@ -90,3 +90,6 @@ typings/
 
 # Electron-Forge
 out/
+
+# Melius workspace artifacts
+.melius/
