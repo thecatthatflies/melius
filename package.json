@@ -1,0 +1,42 @@
+{
+  "name": "melius",
+  "productName": "melius",
+  "version": "1.0.0",
+  "description": "My Electron application description",
+  "main": "src/index.js",
+  "private": true,
+  "scripts": {
+    "start": "electron-forge start",
+    "package": "electron-forge package",
+    "make": "electron-forge make",
+    "publish": "electron-forge publish",
+    "lint": "echo \"No linting configured\""
+  },
+  "keywords": [],
+  "author": {
+    "name": "Aiyan Chowdhury",
+    "email": "aiyan041c10@outlook.com.au"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@electron/asar": "^4.0.1",
+    "@inquirer/editor": "^5.0.7",
+    "@npmcli/move-file": "^3.0.0",
+    "electron-squirrel-startup": "^1.0.1",
+    "external-editor": "^3.1.0",
+    "monaco-editor": "^0.55.1",
+    "tar": "^7.5.9",
+    "tmp": "^0.2.5"
+  },
+  "devDependencies": {
+    "@electron-forge/cli": "^7.6.1",
+    "@electron-forge/maker-deb": "^7.11.1",
+    "@electron-forge/maker-rpm": "^7.11.1",
+    "@electron-forge/maker-squirrel": "^7.3.0",
+    "@electron-forge/maker-zip": "^7.11.1",
+    "@electron-forge/plugin-auto-unpack-natives": "^7.11.1",
+    "@electron-forge/plugin-fuses": "^7.11.1",
+    "@electron/fuses": "^1.8.0",
+    "electron": "40.4.1"
+  }
+}

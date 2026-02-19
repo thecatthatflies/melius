@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Melius</title>
+    <link rel="stylesheet" href="index.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="top-bar">
+        <div class="brand">Melius</div>
+        <div id="active-file-label" class="active-file-label">No file selected</div>
+        <button id="open-folder-button" class="open-folder-button" type="button">
+          Open Folder
+        </button>
+      </header>
+
+      <main id="workspace">
+        <section class="main-area">
+          <aside id="explorer-pane" class="pane">
+            <div class="pane-header">
+              <span>Explorer</span>
+              <span id="root-label" class="root-label">No folder opened</span>
+            </div>
+            <div id="file-tree" class="file-tree"></div>
+          </aside>
+
+          <div
+            id="vertical-splitter"
+            class="splitter vertical"
+            role="separator"
+            aria-label="Resize file explorer"
+            aria-orientation="vertical"
+          ></div>
+
+          <section id="editor-pane" class="pane">
+            <div id="editor-container" class="editor-container"></div>
+          </section>
+        </section>
+
+        <div
+          id="horizontal-splitter"
+          class="splitter horizontal"
+          role="separator"
+          aria-label="Resize terminal"
+          aria-orientation="horizontal"
+        ></div>
+
+        <section id="terminal-pane" class="pane">
+          <div class="pane-header terminal-header">
+            <span>Terminal</span>
+            <button id="clear-terminal-button" class="subtle-button" type="button">
+              Clear
+            </button>
+          </div>
+          <div id="terminal-output" class="terminal-output"></div>
+          <form id="terminal-form" class="terminal-form">
+            <label id="terminal-prompt" class="terminal-prompt" for="terminal-input"></label>
+            <input
+              id="terminal-input"
+              class="terminal-input"
+              type="text"
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </form>
+        </section>
+      </main>
+
+      <footer id="status-bar" class="status-bar">Ready</footer>
+    </div>
+
+    <script src="../node_modules/monaco-editor/min/vs/loader.js"></script>
+    <script src="renderer.js"></script>
+  </body>
+</html>
