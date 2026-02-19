@@ -497,6 +497,44 @@ const normalizeShellProfile = ({ id, label, shellPath, args = [] }) => ({
   args,
 });
 
+const quoteForShell = (value) => {
+  const input = String(value ?? "");
+  if (!input) {
+    return "''";
+  }
+
+  return `'${input.replace(/'/g, "'\\''")}'`;
+};
+
+const resolveScriptFallback = (profile) => {
+  if (!profile || typeof profile.path !== "string" || !profile.path) {
+    return null;
+  }
+
+  const profileArgs = Array.isArray(profile.args) ? profile.args : [];
+
+  if (process.platform === "darwin") {
+    return {
+      command: "script",
+      args: ["-q", "/dev/null", profile.path, ...profileArgs],
+    };
+  }
+
+  if (process.platform === "linux") {
+    const commandLine = [profile.path, ...profileArgs]
+      .map((part) => quoteForShell(part))
+      .join(" ");
+
+    return {
+      command: "script",
+      args: ["-q", "-f", "-c", commandLine, "/dev/null"],
+    };
+  }
+
+  return null;
+};
+
+
 const dedupeShellProfiles = (profiles) => {
   const seen = new Set();
   const output = [];
@@ -703,6 +741,11 @@ const createTerminalSession = async (event, payload) => {
   const sender = event.sender;
   const senderId = sender.id;
   const cwd = await resolveWorkingDirectory(payload?.cwd);
+  const terminalEnv = {
+    ...process.env,
+    TERM: process.env.TERM || "xterm-256color",
+    COLORTERM: process.env.COLORTERM || "truecolor",
+  };
   const requestedCols = Number.parseInt(payload?.cols, 10);
   const requestedRows = Number.parseInt(payload?.rows, 10);
   const cols = Number.isFinite(requestedCols)
@@ -723,7 +766,7 @@ const createTerminalSession = async (event, payload) => {
       const ptyProcess = pty.spawn(selectedProfile.path, selectedProfile.args, {
         name: "xterm-color",
         cwd,
-        env: process.env,
+        env: terminalEnv,
         cols,
         rows,
       });
@@ -772,10 +815,20 @@ const createTerminalSession = async (event, payload) => {
   }
 
   let childProcess;
+  let usedInteractiveFallback = false;
   try {
-    childProcess = spawn(selectedProfile.path, selectedProfile.args, {
+    const scriptFallback =
+      process.platform !== "win32" && (await executableExists("script"))
+        ? resolveScriptFallback(selectedProfile)
+        : null;
+
+    const spawnCommand = scriptFallback?.command || selectedProfile.path;
+    const spawnArgs = scriptFallback?.args || selectedProfile.args;
+    usedInteractiveFallback = Boolean(scriptFallback);
+
+    childProcess = spawn(spawnCommand, spawnArgs, {
       cwd,
-      env: process.env,
+      env: terminalEnv,
       windowsHide: true,
     });
   } catch (error) {
@@ -795,6 +848,7 @@ const createTerminalSession = async (event, payload) => {
       sessionId,
       profile: selectedProfile,
       ptySupported: false,
+      interactiveFallback: usedInteractiveFallback,
     };
   }
 
@@ -858,6 +912,7 @@ const createTerminalSession = async (event, payload) => {
     sessionId,
     profile: selectedProfile,
     ptySupported: false,
+    interactiveFallback: usedInteractiveFallback,
   };
 };
 

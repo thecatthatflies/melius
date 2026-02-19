@@ -45,25 +45,29 @@ const state = {
   extensions: [],
   terminalProfiles: [],
   ptySupported: false,
-  activeTerminalSessionId: null,
-  terminalVisible: true,
+  activeTerminalViewId: null,
+  terminalViewOrder: [],
 };
 
 const editorModels = new Map();
 const savedVersionIds = new Map();
+const terminalViews = new Map();
 
 let monacoInstance;
 let editor;
 let welcomeModel;
-let terminal;
-let fitAddon;
+let terminalRuntimeReady = false;
 let searchSequence = 0;
 let treeRefreshTimer = null;
+let nextTerminalViewId = 1;
+let nextTerminalNameIndex = 1;
+
 let folderSelectionUnsubscribe = () => {};
 let saveRequestUnsubscribe = () => {};
 let terminalDataUnsubscribe = () => {};
 let terminalExitUnsubscribe = () => {};
 let workspaceChangedUnsubscribe = () => {};
+let newTerminalRequestUnsubscribe = () => {};
 
 const elements = {
   activityButtons: Array.from(document.querySelectorAll(".activity-button")),
@@ -83,13 +87,13 @@ const elements = {
   searchInput: document.getElementById("global-search-input"),
   searchResults: document.getElementById("search-results"),
   searchShell: document.getElementById("search-shell"),
+  sidebarSettingsButton: document.getElementById("sidebar-settings-button"),
   statusBar: document.getElementById("status-bar"),
-  terminalCloseButton: document.getElementById("terminal-close-button"),
   terminalContainer: document.getElementById("terminal-container"),
   terminalRestartButton: document.getElementById("terminal-restart-button"),
+  terminalSessionList: document.getElementById("terminal-session-list"),
   terminalShellSelect: document.getElementById("terminal-shell-select"),
   terminalSplitter: document.getElementById("terminal-splitter"),
-  terminalToggleButton: document.getElementById("terminal-toggle-button"),
   verticalSplitter: document.getElementById("vertical-splitter"),
 };
 
@@ -232,6 +236,7 @@ const appendLinkifiedText = (target, text) => {
 
   while ((match = externalUrlPattern.exec(source)) !== null) {
     const [url] = match;
+
     if (match.index > lastIndex) {
       target.appendChild(
         document.createTextNode(source.slice(lastIndex, match.index))
@@ -254,45 +259,38 @@ const appendLinkifiedText = (target, text) => {
   }
 };
 
-const setTerminalVisible = (visible) => {
-  state.terminalVisible = Boolean(visible);
-  document.body.classList.toggle("terminal-hidden", !state.terminalVisible);
-  elements.terminalToggleButton.classList.toggle(
-    "active",
-    state.terminalVisible
-  );
+const getActiveTerminalView = () =>
+  state.activeTerminalViewId && terminalViews.has(state.activeTerminalViewId)
+    ? terminalViews.get(state.activeTerminalViewId)
+    : null;
 
-  if (state.terminalVisible) {
-    void startTerminalSession({ clear: false, preserveIfRunning: true });
+const findTerminalViewBySessionId = (sessionId) => {
+  if (!Number.isInteger(sessionId)) {
+    return null;
   }
 
-  requestAnimationFrame(layoutWorkbench);
-};
-
-const isFileDirty = (filePath) => {
-  if (!filePath || !editorModels.has(filePath)) {
-    return false;
+  for (const view of terminalViews.values()) {
+    if (view.sessionId === sessionId) {
+      return view;
+    }
   }
 
-  const model = editorModels.get(filePath);
-  return savedVersionIds.get(filePath) !== model.getAlternativeVersionId();
+  return null;
 };
 
-const sendTerminalResize = () => {
-  if (
-    !state.terminalVisible ||
-    !terminal ||
-    !state.activeTerminalSessionId ||
-    terminal.cols <= 0 ||
-    terminal.rows <= 0
-  ) {
+const sendTerminalResizeForView = (view) => {
+  if (!view || !view.sessionId) {
+    return;
+  }
+
+  if (view.terminal.cols <= 0 || view.terminal.rows <= 0) {
     return;
   }
 
   window.workbench.resizeTerminalSession(
-    state.activeTerminalSessionId,
-    terminal.cols,
-    terminal.rows
+    view.sessionId,
+    view.terminal.cols,
+    view.terminal.rows
   );
 };
 
@@ -301,18 +299,15 @@ const layoutWorkbench = () => {
     editor.layout();
   }
 
-  if (fitAddon && terminal && state.terminalVisible) {
-    fitAddon.fit();
-    sendTerminalResize();
+  const activeView = getActiveTerminalView();
+  if (activeView) {
+    activeView.fitAddon.fit();
+    sendTerminalResizeForView(activeView);
   }
 };
 
 const setupSplitter = (splitterElement, orientation) => {
   splitterElement.addEventListener("pointerdown", (event) => {
-    if (orientation === "horizontal" && !state.terminalVisible) {
-      return;
-    }
-
     event.preventDefault();
     splitterElement.classList.add("dragging");
 
@@ -340,7 +335,7 @@ const setupSplitter = (splitterElement, orientation) => {
         const minHeight = 120;
         const maxHeight = Math.max(minHeight, stackRect.height - 180);
 
-        const rawHeight = stackRect.bottom - moveEvent.clientY;
+        const rawHeight = moveEvent.clientY - stackRect.top;
         const nextHeight = Math.min(Math.max(rawHeight, minHeight), maxHeight);
 
         document.documentElement.style.setProperty(
@@ -979,12 +974,12 @@ const runSearch = async (query) => {
   renderSearchResults();
 };
 
-const terminalInfo = (message) => {
-  if (!terminal) {
+const terminalInfo = (message, view = getActiveTerminalView()) => {
+  if (!view || !view.terminal) {
     return;
   }
 
-  terminal.writeln(`\x1b[90m${message}\x1b[0m`);
+  view.terminal.writeln(`\x1b[90m${message}\x1b[0m`);
 };
 
 const renderShellProfiles = () => {
@@ -1010,14 +1005,14 @@ const loadTerminalProfiles = async () => {
   renderShellProfiles();
 };
 
-const registerTerminalLinks = () => {
-  if (!terminal || typeof terminal.registerLinkProvider !== "function") {
+const registerTerminalLinks = (xtermInstance) => {
+  if (!xtermInstance || typeof xtermInstance.registerLinkProvider !== "function") {
     return;
   }
 
-  terminal.registerLinkProvider({
+  xtermInstance.registerLinkProvider({
     provideLinks: (lineNumber, callback) => {
-      const line = terminal.buffer.active.getLine(lineNumber - 1);
+      const line = xtermInstance.buffer.active.getLine(lineNumber - 1);
       if (!line) {
         callback([]);
         return;
@@ -1056,68 +1051,215 @@ const registerTerminalLinks = () => {
   });
 };
 
-const startTerminalSession = async ({
-  clear = true,
-  preserveIfRunning = false,
-} = {}) => {
-  if (
-    !terminal ||
-    state.terminalProfiles.length === 0 ||
-    !state.terminalVisible
-  ) {
+const renderTerminalSessionList = () => {
+  elements.terminalSessionList.innerHTML = "";
+
+  const showSessionList = state.terminalViewOrder.length > 1;
+  elements.terminalSessionList.classList.toggle("visible", showSessionList);
+
+  if (!showSessionList) {
     return;
   }
 
-  if (preserveIfRunning && state.activeTerminalSessionId) {
-    layoutWorkbench();
-    terminal.focus();
+  state.terminalViewOrder.forEach((viewId) => {
+    const view = terminalViews.get(viewId);
+    if (!view) {
+      return;
+    }
+
+    const row = document.createElement("div");
+    row.className = `terminal-session-item${
+      view.id === state.activeTerminalViewId ? " active" : ""
+    }`;
+
+    const selectButton = document.createElement("button");
+    selectButton.type = "button";
+    selectButton.className = "terminal-session-name";
+    selectButton.innerHTML = "";
+
+    const title = document.createElement("span");
+    title.textContent = view.name;
+
+    const stateLabel = document.createElement("span");
+    stateLabel.className = "terminal-session-state";
+    stateLabel.textContent = view.sessionId ? "Running" : "Stopped";
+
+    selectButton.append(title, stateLabel);
+    selectButton.addEventListener("click", () => {
+      activateTerminalView(view.id);
+    });
+
+    const renameButton = document.createElement("button");
+    renameButton.type = "button";
+    renameButton.className = "terminal-rename-button";
+    renameButton.setAttribute("aria-label", `Rename ${view.name}`);
+    renameButton.appendChild(createIconElement("fa-solid fa-pen"));
+    renameButton.addEventListener("click", () => {
+      const nextName = window.prompt("Rename terminal", view.name);
+      if (!nextName) {
+        return;
+      }
+
+      const trimmed = nextName.trim();
+      if (!trimmed) {
+        return;
+      }
+
+      view.name = trimmed;
+      renderTerminalSessionList();
+    });
+
+    row.append(selectButton, renameButton);
+    elements.terminalSessionList.appendChild(row);
+  });
+};
+
+const activateTerminalView = (viewId) => {
+  if (!terminalViews.has(viewId)) {
     return;
   }
 
-  if (state.activeTerminalSessionId) {
-    await window.workbench.killTerminalSession(state.activeTerminalSessionId);
-    state.activeTerminalSessionId = null;
+  state.activeTerminalViewId = viewId;
+
+  for (const view of terminalViews.values()) {
+    view.container.style.display = view.id === viewId ? "block" : "none";
   }
 
-  const selectedProfileId =
-    elements.terminalShellSelect.value || state.terminalProfiles[0].id;
+  const activeView = terminalViews.get(viewId);
+  if (activeView) {
+    elements.terminalShellSelect.value = activeView.profileId;
+  }
+
+  renderTerminalSessionList();
+
+  requestAnimationFrame(() => {
+    if (activeView) {
+      activeView.fitAddon.fit();
+      sendTerminalResizeForView(activeView);
+      activeView.terminal.focus();
+    }
+  });
+};
+
+const startTerminalProcessForView = async (view, { clear = true } = {}) => {
+  if (!view) {
+    return;
+  }
+
+  if (view.sessionId) {
+    await window.workbench.killTerminalSession(view.sessionId);
+    view.sessionId = null;
+  }
 
   const cwd = state.rootPath || state.initialCwd || ".";
 
   try {
     const session = await window.workbench.createTerminalSession({
-      profileId: selectedProfileId,
+      profileId: view.profileId,
       cwd,
-      cols: terminal.cols || 120,
-      rows: terminal.rows || 35,
+      cols: view.terminal.cols || 120,
+      rows: view.terminal.rows || 35,
     });
 
-    state.activeTerminalSessionId = session.sessionId;
+    view.sessionId = session.sessionId;
+    view.profileId = session.profile?.id || view.profileId;
 
     if (clear) {
-      terminal.clear();
+      view.terminal.clear();
     }
 
-    terminal.focus();
     terminalInfo(
       `Started ${session.profile.label}${
         session.ptySupported ? "" : " (fallback mode)"
-      }`
+      }`,
+      view
     );
-    layoutWorkbench();
+
+    renderTerminalSessionList();
+
+    if (view.id === state.activeTerminalViewId) {
+      activateTerminalView(view.id);
+    }
   } catch (error) {
-    terminalInfo(`Unable to start terminal: ${error.message}`);
+    terminalInfo(`Unable to start terminal: ${error.message}`, view);
     setStatus(`Terminal failed: ${error.message}`, true);
   }
 };
 
-const setupTerminal = () => {
-  if (!window.Terminal || !window.FitAddon || !window.FitAddon.FitAddon) {
-    setStatus("xterm terminal libraries failed to load.", true);
-    return;
+const ensureTerminalRuntime = () => {
+  if (terminalRuntimeReady) {
+    return true;
   }
 
-  terminal = new window.Terminal({
+  if (!window.Terminal || !window.FitAddon || !window.FitAddon.FitAddon) {
+    setStatus("xterm terminal libraries failed to load.", true);
+    return false;
+  }
+
+  terminalDataUnsubscribe = window.workbench.onTerminalData((payload) => {
+    const view = findTerminalViewBySessionId(payload?.sessionId);
+    if (!view) {
+      return;
+    }
+
+    view.terminal.write(payload.data || "");
+  });
+
+  terminalExitUnsubscribe = window.workbench.onTerminalExit((payload) => {
+    const view = findTerminalViewBySessionId(payload?.sessionId);
+    if (!view) {
+      return;
+    }
+
+    if (view.sessionId !== payload.sessionId) {
+      return;
+    }
+
+    view.sessionId = null;
+
+    const exitCode =
+      typeof payload.exitCode === "number"
+        ? payload.exitCode
+        : payload.signal || "unknown";
+
+    terminalInfo(`Process exited (${exitCode})`, view);
+    renderTerminalSessionList();
+  });
+
+  terminalRuntimeReady = true;
+  return true;
+};
+
+const createTerminalView = async ({
+  profileId = "",
+  name = "",
+  activate = true,
+} = {}) => {
+  if (!ensureTerminalRuntime()) {
+    return null;
+  }
+
+  if (state.terminalProfiles.length === 0) {
+    await loadTerminalProfiles();
+  }
+
+  if (state.terminalProfiles.length === 0) {
+    setStatus("No shell profiles available.", true);
+    return null;
+  }
+
+  const selectedProfileId =
+    profileId || elements.terminalShellSelect.value || state.terminalProfiles[0].id;
+
+  const viewId = nextTerminalViewId;
+  nextTerminalViewId += 1;
+
+  const container = document.createElement("div");
+  container.className = "terminal-instance";
+  container.style.display = "none";
+  elements.terminalContainer.appendChild(container);
+
+  const xterm = new window.Terminal({
     cursorBlink: true,
     scrollback: 5000,
     fontFamily: "Cascadia Code",
@@ -1147,53 +1289,95 @@ const setupTerminal = () => {
     },
   });
 
-  fitAddon = new window.FitAddon.FitAddon();
-  terminal.loadAddon(fitAddon);
-  terminal.open(elements.terminalContainer);
+  const fitAddon = new window.FitAddon.FitAddon();
+  xterm.loadAddon(fitAddon);
+  xterm.open(container);
   fitAddon.fit();
-  registerTerminalLinks();
+  registerTerminalLinks(xterm);
 
-  terminal.onData((data) => {
-    if (!state.activeTerminalSessionId) {
+  const view = {
+    id: viewId,
+    name: name || `Terminal ${nextTerminalNameIndex}`,
+    profileId: selectedProfileId,
+    sessionId: null,
+    terminal: xterm,
+    fitAddon,
+    container,
+  };
+
+  nextTerminalNameIndex += 1;
+
+  xterm.onData((data) => {
+    if (!view.sessionId) {
       return;
     }
 
-    window.workbench.writeTerminalData(state.activeTerminalSessionId, data);
+    window.workbench.writeTerminalData(view.sessionId, data);
   });
 
-  terminal.onResize(({ cols, rows }) => {
-    if (!state.activeTerminalSessionId) {
+  xterm.onResize(({ cols, rows }) => {
+    if (!view.sessionId) {
       return;
     }
 
-    window.workbench.resizeTerminalSession(
-      state.activeTerminalSessionId,
-      cols,
-      rows
-    );
+    window.workbench.resizeTerminalSession(view.sessionId, cols, rows);
   });
 
-  terminalDataUnsubscribe = window.workbench.onTerminalData((payload) => {
-    if (!payload || payload.sessionId !== state.activeTerminalSessionId) {
-      return;
+  terminalViews.set(viewId, view);
+  state.terminalViewOrder.push(viewId);
+
+  if (activate || !state.activeTerminalViewId) {
+    activateTerminalView(viewId);
+  } else {
+    renderTerminalSessionList();
+  }
+
+  await startTerminalProcessForView(view, { clear: true });
+  return view;
+};
+
+const restartActiveTerminal = async () => {
+  const activeView = getActiveTerminalView();
+  if (!activeView) {
+    return;
+  }
+
+  await startTerminalProcessForView(activeView, { clear: true });
+};
+
+const ensureAtLeastOneTerminal = async () => {
+  if (state.terminalViewOrder.length > 0) {
+    const activeView = getActiveTerminalView();
+    if (activeView) {
+      activateTerminalView(activeView.id);
+    }
+    return;
+  }
+
+  await createTerminalView({ activate: true });
+};
+
+const restartAllTerminalViewsForWorkspace = async () => {
+  if (state.terminalViewOrder.length === 0) {
+    await ensureAtLeastOneTerminal();
+    return;
+  }
+
+  const preferredActiveId =
+    state.activeTerminalViewId || state.terminalViewOrder[0] || null;
+
+  for (const viewId of state.terminalViewOrder) {
+    const view = terminalViews.get(viewId);
+    if (!view) {
+      continue;
     }
 
-    terminal.write(payload.data || "");
-  });
+    await startTerminalProcessForView(view, { clear: true });
+  }
 
-  terminalExitUnsubscribe = window.workbench.onTerminalExit((payload) => {
-    if (!payload || payload.sessionId !== state.activeTerminalSessionId) {
-      return;
-    }
-
-    const exitCode =
-      typeof payload.exitCode === "number"
-        ? payload.exitCode
-        : payload.signal || "unknown";
-
-    terminalInfo(`Process exited (${exitCode})`);
-    state.activeTerminalSessionId = null;
-  });
+  if (preferredActiveId && terminalViews.has(preferredActiveId)) {
+    activateTerminalView(preferredActiveId);
+  }
 };
 
 const refreshExtensions = async () => {
@@ -1225,6 +1409,7 @@ const executeExtensionCommand = async (commandId) => {
       commandId,
       []
     );
+
     const output =
       result && Object.prototype.hasOwnProperty.call(result, "result")
         ? result.result
@@ -1309,9 +1494,7 @@ const openFolder = async (folderPath) => {
     setStatus(`Folder opened: ${folderPath}`);
 
     void refreshExtensions();
-    if (state.terminalVisible) {
-      void startTerminalSession({ clear: true });
-    }
+    void restartAllTerminalViewsForWorkspace();
   } catch (error) {
     setStatus(`Unable to open folder: ${error.message}`, true);
   }
@@ -1414,19 +1597,21 @@ const setupEvents = () => {
   });
 
   elements.terminalRestartButton.addEventListener("click", () => {
-    void startTerminalSession({ clear: false });
+    void restartActiveTerminal();
   });
 
   elements.terminalShellSelect.addEventListener("change", () => {
-    void startTerminalSession({ clear: true });
+    const activeView = getActiveTerminalView();
+    if (!activeView) {
+      return;
+    }
+
+    activeView.profileId = elements.terminalShellSelect.value;
+    void startTerminalProcessForView(activeView, { clear: true });
   });
 
-  elements.terminalCloseButton.addEventListener("click", () => {
-    setTerminalVisible(false);
-  });
-
-  elements.terminalToggleButton.addEventListener("click", () => {
-    setTerminalVisible(!state.terminalVisible);
+  elements.sidebarSettingsButton.addEventListener("click", () => {
+    setStatus("Settings panel coming soon.");
   });
 
   elements.searchInput.addEventListener("input", () => {
@@ -1523,33 +1708,53 @@ const setupEvents = () => {
   setupSplitter(elements.verticalSplitter, "vertical");
   setupSplitter(elements.terminalSplitter, "horizontal");
 
-  folderSelectionUnsubscribe = window.workbench.onFolderSelected(
-    (folderPath) => {
-      void openFolder(folderPath);
-    }
-  );
+  folderSelectionUnsubscribe = window.workbench.onFolderSelected((folderPath) => {
+    void openFolder(folderPath);
+  });
 
   saveRequestUnsubscribe = window.workbench.onSaveRequested(() => {
     void saveActiveFile();
   });
 
-  workspaceChangedUnsubscribe = window.workbench.onWorkspaceChanged(
-    (payload) => {
-      if (!state.rootPath || !payload || typeof payload.path !== "string") {
-        return;
-      }
+  newTerminalRequestUnsubscribe = window.workbench.onNewTerminalRequested(() => {
+    void createTerminalView({ activate: true });
+  });
 
-      const normalizedRoot = normalizePath(state.rootPath);
-      const normalizedPath = normalizePath(payload.path);
-
-      if (!normalizedPath.startsWith(normalizedRoot)) {
-        return;
-      }
-
-      invalidateCachesForChange(payload.path);
-      scheduleTreeRefresh();
+  workspaceChangedUnsubscribe = window.workbench.onWorkspaceChanged((payload) => {
+    if (!state.rootPath || !payload || typeof payload.path !== "string") {
+      return;
     }
-  );
+
+    const normalizedRoot = normalizePath(state.rootPath);
+    const normalizedPath = normalizePath(payload.path);
+
+    if (!normalizedPath.startsWith(normalizedRoot)) {
+      return;
+    }
+
+    invalidateCachesForChange(payload.path);
+    scheduleTreeRefresh();
+  });
+};
+
+const disposeAllTerminals = () => {
+  for (const view of terminalViews.values()) {
+    if (view.sessionId) {
+      void window.workbench.killTerminalSession(view.sessionId);
+    }
+
+    try {
+      view.terminal.dispose();
+    } catch {
+      // Ignore dispose errors.
+    }
+
+    view.container.remove();
+  }
+
+  terminalViews.clear();
+  state.terminalViewOrder = [];
+  state.activeTerminalViewId = null;
 };
 
 const initialize = async () => {
@@ -1570,7 +1775,6 @@ const initialize = async () => {
   applyPlatformClass();
   setupEvents();
   setActivePanel("explorer-pane");
-  setTerminalVisible(true);
 
   monacoInstance = await loadMonaco();
 
@@ -1609,19 +1813,17 @@ const initialize = async () => {
 
   state.initialCwd = await window.workbench.getInitialCwd();
 
-  setupTerminal();
+  if (ensureTerminalRuntime()) {
+    await loadTerminalProfiles();
+    await ensureAtLeastOneTerminal();
+    terminalInfo("Terminal ready. Use Ctrl/Cmd+Click to open links.");
+  }
 
   renderFileTree();
   renderTabs();
   renderExtensions();
   setStatus("Ready");
   layoutWorkbench();
-
-  void (async () => {
-    await loadTerminalProfiles();
-    await startTerminalSession({ clear: true });
-    terminalInfo("Terminal ready. Use Ctrl/Cmd+Click to open links.");
-  })();
 };
 
 window.addEventListener("beforeunload", () => {
@@ -1630,10 +1832,7 @@ window.addEventListener("beforeunload", () => {
     treeRefreshTimer = null;
   }
 
-  if (state.activeTerminalSessionId) {
-    void window.workbench.killTerminalSession(state.activeTerminalSessionId);
-  }
-
+  disposeAllTerminals();
   void window.workbench.unwatchWorkspace();
 
   folderSelectionUnsubscribe();
@@ -1641,11 +1840,9 @@ window.addEventListener("beforeunload", () => {
   terminalDataUnsubscribe();
   terminalExitUnsubscribe();
   workspaceChangedUnsubscribe();
+  newTerminalRequestUnsubscribe();
 });
 
 void initialize().catch((error) => {
   setStatus(`Initialization failed: ${error.message}`, true);
-  if (terminal) {
-    terminalInfo(error.message);
-  }
 });
