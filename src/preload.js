@@ -15,13 +15,20 @@ const subscribe = (channel, callback) => {
 
 contextBridge.exposeInMainWorld("workbench", {
   platform: process.platform,
+
   openFolder: () => ipcRenderer.invoke("dialog:openFolder"),
   listDirectory: (directoryPath) =>
     ipcRenderer.invoke("fs:listDirectory", directoryPath),
   readFile: (filePath) => ipcRenderer.invoke("fs:readFile", filePath),
   writeFile: (filePath, content) =>
     ipcRenderer.invoke("fs:writeFile", { path: filePath, content }),
+  watchWorkspace: (workspacePath) =>
+    ipcRenderer.invoke("workspace:watch", workspacePath),
+  unwatchWorkspace: () => ipcRenderer.invoke("workspace:unwatch"),
+  onWorkspaceChanged: (callback) => subscribe("workspace:changed", callback),
+
   getInitialCwd: () => ipcRenderer.invoke("app:getCwd"),
+  openExternal: (targetUrl) => ipcRenderer.invoke("app:openExternal", targetUrl),
 
   listTerminalProfiles: () => ipcRenderer.invoke("terminal:listProfiles"),
   createTerminalSession: (options) =>
@@ -44,4 +51,6 @@ contextBridge.exposeInMainWorld("workbench", {
 
   onFolderSelected: (callback) => subscribe("folder:selected", callback),
   onSaveRequested: (callback) => subscribe("menu:save-file", callback),
+  onNewTerminalRequested: (callback) =>
+    subscribe("menu:new-terminal", callback),
 });

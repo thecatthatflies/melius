@@ -27,6 +27,7 @@ const languageByExtension = new Map([
 ]);
 
 const ignoredSearchDirectories = new Set([".git", "node_modules"]);
+const externalUrlPattern = /\bhttps?:\/\/[^\s<>"')\]]+/gi;
 
 const state = {
   platform: "linux",
@@ -45,6 +46,7 @@ const state = {
   terminalProfiles: [],
   ptySupported: false,
   activeTerminalSessionId: null,
+  terminalVisible: true,
 };
 
 const editorModels = new Map();
@@ -55,26 +57,26 @@ let editor;
 let welcomeModel;
 let terminal;
 let fitAddon;
+let searchSequence = 0;
+let treeRefreshTimer = null;
 let folderSelectionUnsubscribe = () => {};
 let saveRequestUnsubscribe = () => {};
 let terminalDataUnsubscribe = () => {};
 let terminalExitUnsubscribe = () => {};
-let searchSequence = 0;
+let workspaceChangedUnsubscribe = () => {};
 
 const elements = {
   activityButtons: Array.from(document.querySelectorAll(".activity-button")),
-  activeFileLabel: document.getElementById("active-file-label"),
   createExtensionButton: document.getElementById("create-extension-button"),
   editorContainer: document.getElementById("editor-container"),
+  editorStack: document.getElementById("editor-stack"),
   editorTabs: document.getElementById("editor-tabs"),
   extensionIdInput: document.getElementById("extension-id-input"),
   extensionsList: document.getElementById("extensions-list"),
   extensionsPane: document.getElementById("extensions-pane"),
   explorerPane: document.getElementById("explorer-pane"),
   fileTree: document.getElementById("file-tree"),
-  horizontalSplitter: document.getElementById("horizontal-splitter"),
   mainArea: document.getElementById("main-area"),
-  openFolderButton: document.getElementById("open-folder-button"),
   reloadExtensionsButton: document.getElementById("reload-extensions-button"),
   rootLabel: document.getElementById("root-label"),
   searchClearButton: document.getElementById("search-clear-button"),
@@ -82,11 +84,13 @@ const elements = {
   searchResults: document.getElementById("search-results"),
   searchShell: document.getElementById("search-shell"),
   statusBar: document.getElementById("status-bar"),
+  terminalCloseButton: document.getElementById("terminal-close-button"),
   terminalContainer: document.getElementById("terminal-container"),
   terminalRestartButton: document.getElementById("terminal-restart-button"),
   terminalShellSelect: document.getElementById("terminal-shell-select"),
+  terminalSplitter: document.getElementById("terminal-splitter"),
+  terminalToggleButton: document.getElementById("terminal-toggle-button"),
   verticalSplitter: document.getElementById("vertical-splitter"),
-  workspace: document.getElementById("workspace"),
 };
 
 const basename = (fullPath) => {
@@ -94,13 +98,15 @@ const basename = (fullPath) => {
   return parts.length > 0 ? parts[parts.length - 1] : fullPath;
 };
 
+const normalizePath = (value) => String(value || "").replace(/\\/g, "/");
+
 const relativePath = (fullPath) => {
   if (!state.rootPath) {
     return fullPath;
   }
 
-  const normalizedRoot = state.rootPath.replace(/\\/g, "/");
-  const normalizedPath = fullPath.replace(/\\/g, "/");
+  const normalizedRoot = normalizePath(state.rootPath);
+  const normalizedPath = normalizePath(fullPath);
 
   if (normalizedPath === normalizedRoot) {
     return basename(fullPath);
@@ -190,14 +196,8 @@ const getTreeIconClass = (entryPath, entryType, expanded = false) => {
   return getFileIconClass(entryPath);
 };
 
-const isFileDirty = (filePath) => {
-  if (!filePath || !editorModels.has(filePath)) {
-    return false;
-  }
-
-  const model = editorModels.get(filePath);
-  return savedVersionIds.get(filePath) !== model.getAlternativeVersionId();
-};
+const isExternalUrl = (value) =>
+  typeof value === "string" && /^(https?:\/\/|mailto:)/i.test(value.trim());
 
 const createIconElement = (classes, extraClass = "") => {
   const icon = document.createElement("i");
@@ -214,18 +214,78 @@ const setStatus = (message, isError = false) => {
   elements.statusBar.style.borderTopColor = isError ? "#a23d51" : "#2e507f";
 };
 
-const updateActiveFileLabel = () => {
-  if (!state.activeFilePath) {
-    elements.activeFileLabel.textContent = "No file selected";
-    return;
+const openExternalLink = async (url) => {
+  const ok = await window.workbench.openExternal(url);
+  if (!ok) {
+    setStatus(`Unable to open URL: ${url}`, true);
+  }
+};
+
+const appendLinkifiedText = (target, text) => {
+  target.textContent = "";
+
+  const source = String(text || "");
+  externalUrlPattern.lastIndex = 0;
+
+  let lastIndex = 0;
+  let match;
+
+  while ((match = externalUrlPattern.exec(source)) !== null) {
+    const [url] = match;
+    if (match.index > lastIndex) {
+      target.appendChild(
+        document.createTextNode(source.slice(lastIndex, match.index))
+      );
+    }
+
+    const anchor = document.createElement("a");
+    anchor.className = "inline-link";
+    anchor.href = url;
+    anchor.textContent = url;
+    anchor.rel = "noreferrer noopener";
+    anchor.target = "_blank";
+    target.appendChild(anchor);
+
+    lastIndex = match.index + url.length;
   }
 
-  const dirtyMark = isFileDirty(state.activeFilePath) ? " •" : "";
-  elements.activeFileLabel.textContent = `${relativePath(state.activeFilePath)}${dirtyMark}`;
+  if (lastIndex < source.length) {
+    target.appendChild(document.createTextNode(source.slice(lastIndex)));
+  }
+};
+
+const setTerminalVisible = (visible) => {
+  state.terminalVisible = Boolean(visible);
+  document.body.classList.toggle("terminal-hidden", !state.terminalVisible);
+  elements.terminalToggleButton.classList.toggle(
+    "active",
+    state.terminalVisible
+  );
+
+  if (state.terminalVisible) {
+    void startTerminalSession({ clear: false, preserveIfRunning: true });
+  }
+
+  requestAnimationFrame(layoutWorkbench);
+};
+
+const isFileDirty = (filePath) => {
+  if (!filePath || !editorModels.has(filePath)) {
+    return false;
+  }
+
+  const model = editorModels.get(filePath);
+  return savedVersionIds.get(filePath) !== model.getAlternativeVersionId();
 };
 
 const sendTerminalResize = () => {
-  if (!terminal || !state.activeTerminalSessionId) {
+  if (
+    !state.terminalVisible ||
+    !terminal ||
+    !state.activeTerminalSessionId ||
+    terminal.cols <= 0 ||
+    terminal.rows <= 0
+  ) {
     return;
   }
 
@@ -241,7 +301,7 @@ const layoutWorkbench = () => {
     editor.layout();
   }
 
-  if (fitAddon && terminal) {
+  if (fitAddon && terminal && state.terminalVisible) {
     fitAddon.fit();
     sendTerminalResize();
   }
@@ -249,6 +309,10 @@ const layoutWorkbench = () => {
 
 const setupSplitter = (splitterElement, orientation) => {
   splitterElement.addEventListener("pointerdown", (event) => {
+    if (orientation === "horizontal" && !state.terminalVisible) {
+      return;
+    }
+
     event.preventDefault();
     splitterElement.classList.add("dragging");
 
@@ -258,7 +322,7 @@ const setupSplitter = (splitterElement, orientation) => {
         const activityRect = document
           .getElementById("activity-bar")
           .getBoundingClientRect();
-        const minWidth = 220;
+        const minWidth = 200;
         const maxWidth = Math.max(
           minWidth,
           mainRect.width - activityRect.width - 260
@@ -272,11 +336,11 @@ const setupSplitter = (splitterElement, orientation) => {
           `${Math.round(nextWidth)}px`
         );
       } else {
-        const workspaceRect = elements.workspace.getBoundingClientRect();
-        const minHeight = 140;
-        const maxHeight = Math.max(minHeight, workspaceRect.height - 170);
+        const stackRect = elements.editorStack.getBoundingClientRect();
+        const minHeight = 120;
+        const maxHeight = Math.max(minHeight, stackRect.height - 180);
 
-        const rawHeight = workspaceRect.bottom - moveEvent.clientY;
+        const rawHeight = stackRect.bottom - moveEvent.clientY;
         const nextHeight = Math.min(Math.max(rawHeight, minHeight), maxHeight);
 
         document.documentElement.style.setProperty(
@@ -396,7 +460,9 @@ const renderTabs = () => {
   state.openTabs.forEach((filePath) => {
     const tabButton = document.createElement("button");
     tabButton.type = "button";
-    tabButton.className = `editor-tab${filePath === state.activeFilePath ? " active" : ""}`;
+    tabButton.className = `editor-tab${
+      filePath === state.activeFilePath ? " active" : ""
+    }`;
 
     const icon = createIconElement(
       getFileIconClass(filePath),
@@ -474,7 +540,9 @@ const renderExtensions = () => {
     nameGroup.append(name, meta);
 
     const status = document.createElement("span");
-    status.className = `extension-status${extension.status === "error" ? " error" : ""}`;
+    status.className = `extension-status${
+      extension.status === "error" ? " error" : ""
+    }`;
     status.textContent = extension.status === "error" ? "Error" : "Loaded";
 
     header.append(nameGroup, status);
@@ -483,7 +551,7 @@ const renderExtensions = () => {
     if (extension.description) {
       const description = document.createElement("div");
       description.className = "extension-description";
-      description.textContent = extension.description;
+      appendLinkifiedText(description, extension.description);
       card.appendChild(description);
     }
 
@@ -579,7 +647,6 @@ const showWelcomeModel = () => {
 
   renderTabs();
   renderFileTree();
-  updateActiveFileLabel();
   layoutWorkbench();
 };
 
@@ -600,7 +667,6 @@ const activateTab = async (filePath) => {
 
     renderTabs();
     renderFileTree();
-    updateActiveFileLabel();
     layoutWorkbench();
     setStatus(`Opened ${relativePath(filePath)}`);
   } catch (error) {
@@ -632,7 +698,6 @@ const closeTab = async (filePath) => {
   }
 
   renderTabs();
-  updateActiveFileLabel();
   renderFileTree();
   setStatus(`Closed ${relativePath(filePath)}`);
 };
@@ -648,11 +713,68 @@ const saveActiveFile = async () => {
     await window.workbench.writeFile(state.activeFilePath, model.getValue());
     savedVersionIds.set(state.activeFilePath, model.getAlternativeVersionId());
     renderTabs();
-    updateActiveFileLabel();
     setStatus(`Saved ${relativePath(state.activeFilePath)}`);
   } catch (error) {
     setStatus(`Save failed: ${error.message}`, true);
   }
+};
+
+const invalidateCachesForChange = (changedPath) => {
+  if (!changedPath) {
+    state.directoryCache.clear();
+    state.searchIndexRoot = "";
+    state.searchIndex = [];
+    return;
+  }
+
+  const normalizedChanged = normalizePath(changedPath);
+
+  for (const cachePath of [...state.directoryCache.keys()]) {
+    const normalizedCachePath = normalizePath(cachePath);
+
+    if (
+      normalizedCachePath === normalizedChanged ||
+      normalizedCachePath.startsWith(`${normalizedChanged}/`) ||
+      normalizedChanged.startsWith(`${normalizedCachePath}/`)
+    ) {
+      state.directoryCache.delete(cachePath);
+    }
+  }
+
+  state.searchIndexRoot = "";
+  state.searchIndex = [];
+};
+
+const refreshVisibleTree = async () => {
+  if (!state.rootPath) {
+    return;
+  }
+
+  const expanded = [...state.expandedDirectories].sort((a, b) =>
+    a.localeCompare(b)
+  );
+
+  for (const directoryPath of expanded) {
+    try {
+      await ensureDirectoryLoaded(directoryPath);
+    } catch {
+      state.expandedDirectories.delete(directoryPath);
+      state.directoryCache.delete(directoryPath);
+    }
+  }
+
+  renderFileTree();
+};
+
+const scheduleTreeRefresh = () => {
+  if (treeRefreshTimer) {
+    return;
+  }
+
+  treeRefreshTimer = setTimeout(() => {
+    treeRefreshTimer = null;
+    void refreshVisibleTree();
+  }, 120);
 };
 
 const buildSearchIndex = async () => {
@@ -769,7 +891,9 @@ const renderSearchResults = () => {
   state.searchResults.forEach((filePath, index) => {
     const item = document.createElement("button");
     item.type = "button";
-    item.className = `search-result-item${index === state.selectedSearchResult ? " active" : ""}`;
+    item.className = `search-result-item${
+      index === state.selectedSearchResult ? " active" : ""
+    }`;
 
     const icon = createIconElement(
       getFileIconClass(filePath),
@@ -886,8 +1010,67 @@ const loadTerminalProfiles = async () => {
   renderShellProfiles();
 };
 
-const startTerminalSession = async ({ clear = true } = {}) => {
-  if (!terminal || state.terminalProfiles.length === 0) {
+const registerTerminalLinks = () => {
+  if (!terminal || typeof terminal.registerLinkProvider !== "function") {
+    return;
+  }
+
+  terminal.registerLinkProvider({
+    provideLinks: (lineNumber, callback) => {
+      const line = terminal.buffer.active.getLine(lineNumber - 1);
+      if (!line) {
+        callback([]);
+        return;
+      }
+
+      const text = line.translateToString(true);
+      externalUrlPattern.lastIndex = 0;
+
+      const links = [];
+      let match;
+
+      while ((match = externalUrlPattern.exec(text)) !== null) {
+        const url = match[0];
+        const startX = match.index + 1;
+        const endX = startX + url.length;
+
+        links.push({
+          range: {
+            start: { x: startX, y: lineNumber },
+            end: { x: endX, y: lineNumber },
+          },
+          text: url,
+          activate: (event, textValue) => {
+            if (!event || (!event.ctrlKey && !event.metaKey)) {
+              terminalInfo("Use Ctrl/Cmd+Click to open links.");
+              return;
+            }
+
+            void openExternalLink(textValue);
+          },
+        });
+      }
+
+      callback(links);
+    },
+  });
+};
+
+const startTerminalSession = async ({
+  clear = true,
+  preserveIfRunning = false,
+} = {}) => {
+  if (
+    !terminal ||
+    state.terminalProfiles.length === 0 ||
+    !state.terminalVisible
+  ) {
+    return;
+  }
+
+  if (preserveIfRunning && state.activeTerminalSessionId) {
+    layoutWorkbench();
+    terminal.focus();
     return;
   }
 
@@ -901,24 +1084,31 @@ const startTerminalSession = async ({ clear = true } = {}) => {
 
   const cwd = state.rootPath || state.initialCwd || ".";
 
-  const session = await window.workbench.createTerminalSession({
-    profileId: selectedProfileId,
-    cwd,
-    cols: terminal.cols || 120,
-    rows: terminal.rows || 35,
-  });
+  try {
+    const session = await window.workbench.createTerminalSession({
+      profileId: selectedProfileId,
+      cwd,
+      cols: terminal.cols || 120,
+      rows: terminal.rows || 35,
+    });
 
-  state.activeTerminalSessionId = session.sessionId;
+    state.activeTerminalSessionId = session.sessionId;
 
-  if (clear) {
-    terminal.clear();
+    if (clear) {
+      terminal.clear();
+    }
+
+    terminal.focus();
+    terminalInfo(
+      `Started ${session.profile.label}${
+        session.ptySupported ? "" : " (fallback mode)"
+      }`
+    );
+    layoutWorkbench();
+  } catch (error) {
+    terminalInfo(`Unable to start terminal: ${error.message}`);
+    setStatus(`Terminal failed: ${error.message}`, true);
   }
-
-  terminal.focus();
-
-  terminalInfo(
-    `Started ${session.profile.label}${session.ptySupported ? "" : " (fallback mode)"}`
-  );
 };
 
 const setupTerminal = () => {
@@ -961,6 +1151,7 @@ const setupTerminal = () => {
   terminal.loadAddon(fitAddon);
   terminal.open(elements.terminalContainer);
   fitAddon.fit();
+  registerTerminalLinks();
 
   terminal.onData((data) => {
     if (!state.activeTerminalSessionId) {
@@ -1090,6 +1281,8 @@ const openFolder = async (folderPath) => {
   }
 
   try {
+    await window.workbench.unwatchWorkspace();
+
     state.rootPath = folderPath;
     state.expandedDirectories = new Set([folderPath]);
     state.directoryCache = new Map();
@@ -1111,10 +1304,14 @@ const openFolder = async (folderPath) => {
     showWelcomeModel();
     renderFileTree();
 
-    await refreshExtensions();
-    await startTerminalSession({ clear: true });
+    await window.workbench.watchWorkspace(folderPath);
 
     setStatus(`Folder opened: ${folderPath}`);
+
+    void refreshExtensions();
+    if (state.terminalVisible) {
+      void startTerminalSession({ clear: true });
+    }
   } catch (error) {
     setStatus(`Unable to open folder: ${error.message}`, true);
   }
@@ -1162,6 +1359,28 @@ const loadMonaco = () =>
     );
   });
 
+const getUrlAtModelPosition = (model, position) => {
+  if (!model || !position) {
+    return "";
+  }
+
+  const line = model.getLineContent(position.lineNumber);
+  externalUrlPattern.lastIndex = 0;
+
+  let match;
+  while ((match = externalUrlPattern.exec(line)) !== null) {
+    const url = match[0];
+    const start = match.index + 1;
+    const end = start + url.length;
+
+    if (position.column >= start && position.column <= end) {
+      return url;
+    }
+  }
+
+  return "";
+};
+
 const applyPlatformClass = () => {
   const platform =
     window.workbench && typeof window.workbench.platform === "string"
@@ -1177,15 +1396,6 @@ const setupEvents = () => {
     button.addEventListener("click", () => {
       setActivePanel(button.dataset.panel);
     });
-  });
-
-  elements.openFolderButton.addEventListener("click", async () => {
-    try {
-      const folderPath = await window.workbench.openFolder();
-      await openFolder(folderPath);
-    } catch (error) {
-      setStatus(`Unable to open folder picker: ${error.message}`, true);
-    }
   });
 
   elements.reloadExtensionsButton.addEventListener("click", () => {
@@ -1209,6 +1419,14 @@ const setupEvents = () => {
 
   elements.terminalShellSelect.addEventListener("change", () => {
     void startTerminalSession({ clear: true });
+  });
+
+  elements.terminalCloseButton.addEventListener("click", () => {
+    setTerminalVisible(false);
+  });
+
+  elements.terminalToggleButton.addEventListener("click", () => {
+    setTerminalVisible(!state.terminalVisible);
   });
 
   elements.searchInput.addEventListener("input", () => {
@@ -1254,23 +1472,56 @@ const setupEvents = () => {
     }
   });
 
+  document.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+
+    const anchor = target.closest("a[href]");
+    if (!anchor) {
+      return;
+    }
+
+    event.preventDefault();
+
+    if (!(event.ctrlKey || event.metaKey)) {
+      setStatus("Use Ctrl/Cmd+Click to open links.");
+      return;
+    }
+
+    void openExternalLink(anchor.href);
+  });
+
   window.addEventListener("resize", layoutWorkbench);
   window.addEventListener("keydown", (event) => {
-    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
+    const key = event.key.toLowerCase();
+
+    if ((event.metaKey || event.ctrlKey) && key === "s") {
       event.preventDefault();
       void saveActiveFile();
       return;
     }
 
-    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "p") {
+    if ((event.metaKey || event.ctrlKey) && key === "k") {
       event.preventDefault();
       elements.searchInput.focus();
       elements.searchInput.select();
+      return;
+    }
+
+    if ((event.metaKey || event.ctrlKey) && key === "r") {
+      event.preventDefault();
+      return;
+    }
+
+    if (event.key === "F5") {
+      event.preventDefault();
     }
   });
 
   setupSplitter(elements.verticalSplitter, "vertical");
-  setupSplitter(elements.horizontalSplitter, "horizontal");
+  setupSplitter(elements.terminalSplitter, "horizontal");
 
   folderSelectionUnsubscribe = window.workbench.onFolderSelected(
     (folderPath) => {
@@ -1281,6 +1532,24 @@ const setupEvents = () => {
   saveRequestUnsubscribe = window.workbench.onSaveRequested(() => {
     void saveActiveFile();
   });
+
+  workspaceChangedUnsubscribe = window.workbench.onWorkspaceChanged(
+    (payload) => {
+      if (!state.rootPath || !payload || typeof payload.path !== "string") {
+        return;
+      }
+
+      const normalizedRoot = normalizePath(state.rootPath);
+      const normalizedPath = normalizePath(payload.path);
+
+      if (!normalizedPath.startsWith(normalizedRoot)) {
+        return;
+      }
+
+      invalidateCachesForChange(payload.path);
+      scheduleTreeRefresh();
+    }
+  );
 };
 
 const initialize = async () => {
@@ -1288,8 +1557,20 @@ const initialize = async () => {
     throw new Error("Workbench API is unavailable in this renderer.");
   }
 
+  const originalWindowOpen = window.open.bind(window);
+  window.open = (url, ...args) => {
+    if (typeof url === "string" && isExternalUrl(url)) {
+      void openExternalLink(url);
+      return null;
+    }
+
+    return originalWindowOpen(url, ...args);
+  };
+
   applyPlatformClass();
   setupEvents();
+  setActivePanel("explorer-pane");
+  setTerminalVisible(true);
 
   monacoInstance = await loadMonaco();
 
@@ -1307,38 +1588,59 @@ const initialize = async () => {
     fontFamily: "Cascadia Code",
     scrollBeyondLastLine: false,
     automaticLayout: false,
+    links: true,
   });
 
   editor.onDidChangeModelContent(() => {
     renderTabs();
-    updateActiveFileLabel();
+  });
+
+  editor.onMouseDown((mouseEvent) => {
+    if (!(mouseEvent.event.metaKey || mouseEvent.event.ctrlKey)) {
+      return;
+    }
+
+    const model = editor.getModel();
+    const url = getUrlAtModelPosition(model, mouseEvent.target.position);
+    if (url && isExternalUrl(url)) {
+      void openExternalLink(url);
+    }
   });
 
   state.initialCwd = await window.workbench.getInitialCwd();
 
   setupTerminal();
-  await loadTerminalProfiles();
-  await startTerminalSession({ clear: true });
 
   renderFileTree();
   renderTabs();
   renderExtensions();
-  updateActiveFileLabel();
-
-  terminalInfo("Terminal ready.");
   setStatus("Ready");
   layoutWorkbench();
+
+  void (async () => {
+    await loadTerminalProfiles();
+    await startTerminalSession({ clear: true });
+    terminalInfo("Terminal ready. Use Ctrl/Cmd+Click to open links.");
+  })();
 };
 
 window.addEventListener("beforeunload", () => {
+  if (treeRefreshTimer) {
+    clearTimeout(treeRefreshTimer);
+    treeRefreshTimer = null;
+  }
+
   if (state.activeTerminalSessionId) {
     void window.workbench.killTerminalSession(state.activeTerminalSessionId);
   }
+
+  void window.workbench.unwatchWorkspace();
 
   folderSelectionUnsubscribe();
   saveRequestUnsubscribe();
   terminalDataUnsubscribe();
   terminalExitUnsubscribe();
+  workspaceChangedUnsubscribe();
 });
 
 void initialize().catch((error) => {

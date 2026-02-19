@@ -1,4 +1,11 @@
-const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require("electron");
+const {
+  app,
+  BrowserWindow,
+  Menu,
+  dialog,
+  ipcMain,
+  shell,
+} = require("electron");
 const fsNative = require("node:fs");
 const { constants: fsConstants } = fsNative;
 const fs = require("node:fs/promises");
@@ -51,8 +58,6 @@ const getExtensionRuntimeState = (webContentsId) => {
   return extensionRuntimesByWebContentsId.get(webContentsId);
 };
 
-const normalizePath = (value) => String(value || "").replace(/\\/g, "/");
-
 const normalizeExternalUrl = (rawUrl) => {
   if (typeof rawUrl !== "string") {
     return "";
@@ -67,7 +72,7 @@ const normalizeExternalUrl = (rawUrl) => {
 
   try {
     const parsed = new URL(withProtocol);
-    if (!["http:", "https:", "mailto:"].includes(parsed.protocol)) {
+    if (!parsed || !["http:", "https:", "mailto:"].includes(parsed.protocol)) {
       return "";
     }
 
@@ -391,6 +396,17 @@ const openFolderForWindow = async (targetWindow) => {
   return selectedPath;
 };
 
+const sendToWindow = (mainWindow, channel) => {
+  const targetWindow =
+    BrowserWindow.getFocusedWindow() ||
+    BrowserWindow.getAllWindows()[0] ||
+    mainWindow;
+
+  if (targetWindow && !targetWindow.isDestroyed()) {
+    targetWindow.webContents.send(channel);
+  }
+};
+
 const buildMenu = (mainWindow) => {
   const template = [
     ...(isMac ? [{ role: "appMenu" }] : []),
@@ -415,16 +431,24 @@ const buildMenu = (mainWindow) => {
         {
           label: "Save File",
           accelerator: "CmdOrCtrl+S",
-          click: (_menuItem, focusedWindow) => {
-            const targetWindow =
-              focusedWindow || BrowserWindow.getFocusedWindow();
-            if (targetWindow && !targetWindow.isDestroyed()) {
-              targetWindow.webContents.send("menu:save-file");
-            }
+          click: () => {
+            sendToWindow(mainWindow, "menu:save-file");
           },
         },
         { type: "separator" },
         isMac ? { role: "close" } : { role: "quit" },
+      ],
+    },
+    {
+      label: "Terminal",
+      submenu: [
+        {
+          label: "New Terminal",
+          accelerator: "CmdOrCtrl+Shift+`",
+          click: () => {
+            sendToWindow(mainWindow, "menu:new-terminal");
+          },
+        },
       ],
     },
     { role: "editMenu" },
@@ -505,7 +529,11 @@ const probeCandidateProfiles = async (candidates) => {
 };
 
 const detectShellProfiles = async ({ force = false } = {}) => {
-  if (!force && Array.isArray(shellProfilesCache) && shellProfilesCache.length) {
+  if (
+    !force &&
+    Array.isArray(shellProfilesCache) &&
+    shellProfilesCache.length
+  ) {
     return shellProfilesCache;
   }
 
@@ -1345,10 +1373,21 @@ const createWindow = () => {
 
   mainWindow.webContents.on("will-navigate", (event, targetUrl) => {
     const currentUrl = mainWindow.webContents.getURL();
-    if (targetUrl !== currentUrl) {
-      event.preventDefault();
-      void openExternalUrl(targetUrl);
+    if (targetUrl === currentUrl) {
+      return;
     }
+
+    try {
+      const parsed = new URL(targetUrl);
+      if (parsed.protocol === "file:" || parsed.protocol === "devtools:") {
+        return;
+      }
+    } catch {
+      return;
+    }
+
+    event.preventDefault();
+    void openExternalUrl(targetUrl);
   });
 
   mainWindow.webContents.on("before-input-event", (event, input) => {

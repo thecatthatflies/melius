@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Melius</title>
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.7.2/css/all.min.css"
+      referrerpolicy="no-referrer"
+    />
+    <link rel="stylesheet" href="../node_modules/xterm/css/xterm.css" />
+    <link rel="stylesheet" href="index.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="title-bar">
+        <div id="search-shell" class="search-shell">
+          <i
+            class="fa-solid fa-magnifying-glass search-icon"
+            aria-hidden="true"
+          ></i>
+          <input
+            id="global-search-input"
+            class="search-input"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="Search files (Cmd/Ctrl+K)"
+          />
+          <button
+            id="search-clear-button"
+            class="search-clear-button"
+            type="button"
+            aria-label="Clear search"
+          >
+            <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+          </button>
+          <div id="search-results" class="search-results"></div>
+        </div>
+      </header>
+
+      <main id="workspace">
+        <section id="main-area" class="main-area">
+          <nav id="activity-bar" class="activity-bar" aria-label="Panels">
+            <button
+              type="button"
+              class="activity-button active"
+              data-panel="explorer-pane"
+              aria-label="Explorer"
+              title="Explorer"
+            >
+              <i class="fa-regular fa-folder-open" aria-hidden="true"></i>
+            </button>
+            <button
+              type="button"
+              class="activity-button"
+              data-panel="extensions-pane"
+              aria-label="Extensions"
+              title="Extensions"
+            >
+              <i class="fa-solid fa-puzzle-piece" aria-hidden="true"></i>
+            </button>
+          </nav>
+
+          <aside id="side-panel" class="pane side-panel">
+            <div class="side-panel-content">
+              <section id="explorer-pane" class="panel-view active">
+                <div class="pane-header">
+                  <span class="pane-title">
+                    <i class="fa-regular fa-folder-open" aria-hidden="true"></i>
+                    Explorer
+                  </span>
+                  <span id="root-label" class="root-label">No folder opened</span>
+                </div>
+                <div id="file-tree" class="file-tree"></div>
+              </section>
+
+              <section id="extensions-pane" class="panel-view">
+                <div class="pane-header">
+                  <span class="pane-title">
+                    <i class="fa-solid fa-puzzle-piece" aria-hidden="true"></i>
+                    Extensions
+                  </span>
+                  <button
+                    id="reload-extensions-button"
+                    class="subtle-button"
+                    type="button"
+                  >
+                    Reload
+                  </button>
+                </div>
+
+                <div class="extensions-content">
+                  <div class="extension-baseplate">
+                    <label
+                      for="extension-id-input"
+                      class="extension-baseplate-label"
+                      >New Extension ID</label
+                    >
+                    <div class="extension-baseplate-row">
+                      <input
+                        id="extension-id-input"
+                        class="extension-id-input"
+                        type="text"
+                        autocomplete="off"
+                        spellcheck="false"
+                        placeholder="my-extension"
+                      />
+                      <button
+                        id="create-extension-button"
+                        class="top-action-button"
+                        type="button"
+                      >
+                        Create
+                      </button>
+                    </div>
+                    <div class="extension-baseplate-note">
+                      Creates <code>.melius/extensions/&lt;id&gt;</code> with
+                      <code>extension.json</code> and <code>main.js</code>.
+                    </div>
+                  </div>
+
+                  <div id="extensions-list" class="extensions-list"></div>
+                </div>
+              </section>
+            </div>
+
+            <div class="sidebar-settings-bar">
+              <button
+                id="sidebar-settings-button"
+                class="sidebar-settings-button"
+                type="button"
+                aria-label="Settings"
+              >
+                <i class="fa-solid fa-gear" aria-hidden="true"></i>
+                <span>Settings</span>
+              </button>
+            </div>
+          </aside>
+
+          <div
+            id="vertical-splitter"
+            class="splitter vertical"
+            role="separator"
+            aria-label="Resize sidebar"
+            aria-orientation="vertical"
+          ></div>
+
+          <section id="editor-stack" class="pane editor-stack">
+            <section id="terminal-pane" class="pane">
+              <div class="pane-header terminal-pane-header">
+                <span class="pane-title">
+                  <i class="fa-solid fa-terminal" aria-hidden="true"></i>
+                  Terminal
+                </span>
+
+                <div class="terminal-toolbar">
+                  <select
+                    id="terminal-shell-select"
+                    class="terminal-shell-select"
+                    aria-label="Shell profile"
+                  ></select>
+                  <button
+                    id="terminal-restart-button"
+                    class="subtle-button"
+                    type="button"
+                  >
+                    Restart
+                  </button>
+                </div>
+              </div>
+
+              <div class="terminal-body">
+                <div id="terminal-container" class="terminal-container"></div>
+                <aside
+                  id="terminal-session-list"
+                  class="terminal-session-list"
+                  aria-label="Terminals"
+                ></aside>
+              </div>
+            </section>
+
+            <div
+              id="terminal-splitter"
+              class="splitter horizontal"
+              role="separator"
+              aria-label="Resize terminal"
+              aria-orientation="horizontal"
+            ></div>
+
+            <section id="editor-pane" class="pane editor-pane">
+              <div class="editor-header">
+                <div id="editor-tabs" class="editor-tabs"></div>
+              </div>
+              <div id="editor-container" class="editor-container"></div>
+            </section>
+          </section>
+        </section>
+      </main>
+
+      <footer id="status-bar" class="status-bar">Ready</footer>
+    </div>
+
+    <script src="../node_modules/monaco-editor/min/vs/loader.js"></script>
+    <script src="../node_modules/xterm/lib/xterm.js"></script>
+    <script src="../node_modules/xterm-addon-fit/lib/xterm-addon-fit.js"></script>
+    <script src="renderer.js"></script>
+  </body>
+</html>
