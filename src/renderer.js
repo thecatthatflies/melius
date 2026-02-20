@@ -40,6 +40,7 @@ const state = {
   openTabs: [],
   searchIndexRoot: "",
   searchIndex: [],
+  searchIndexDirty: true,
   searchResults: [],
   selectedSearchResult: 0,
   extensions: [],
@@ -59,6 +60,7 @@ let welcomeModel;
 let terminalRuntimeReady = false;
 let searchSequence = 0;
 let treeRefreshTimer = null;
+const pendingWorkspaceChanges = new Set();
 let nextTerminalViewId = 1;
 let nextTerminalNameIndex = 1;
 
@@ -137,9 +139,29 @@ const detectLanguage = (filePath) => {
   return languageByExtension.get(extensionMatch[1]) || "plaintext";
 };
 
+const brandedFileBadgeByExtension = new Map([
+  ["ts", { label: "TS", className: "file-badge-ts" }],
+  ["tsx", { label: "TSX", className: "file-badge-tsx" }],
+  ["js", { label: "JS", className: "file-badge-js" }],
+  ["jsx", { label: "JSX", className: "file-badge-jsx" }],
+  ["html", { label: "HTML", className: "file-badge-html" }],
+  ["css", { label: "CSS", className: "file-badge-css" }],
+  ["json", { label: "JSON", className: "file-badge-json" }],
+  ["md", { label: "MD", className: "file-badge-md" }],
+]);
+
+const getFileExtension = (filePath) => {
+  const extensionMatch = String(filePath || "")
+    .toLowerCase()
+    .match(/\.([^.\/]+)$/);
+  return extensionMatch ? extensionMatch[1] : "";
+};
+
+const getBrandedFileBadge = (filePath) =>
+  brandedFileBadgeByExtension.get(getFileExtension(filePath)) || null;
+
 const getFileIconClass = (filePath) => {
-  const extensionMatch = filePath.toLowerCase().match(/\.([^.\\/]+)$/);
-  const extension = extensionMatch ? extensionMatch[1] : "";
+  const extension = getFileExtension(filePath);
 
   if (
     extension &&
@@ -163,11 +185,6 @@ const getFileIconClass = (filePath) => {
   if (
     extension &&
     [
-      "js",
-      "ts",
-      "jsx",
-      "tsx",
-      "json",
       "go",
       "rs",
       "py",
@@ -177,8 +194,6 @@ const getFileIconClass = (filePath) => {
       "c",
       "h",
       "hpp",
-      "css",
-      "html",
       "xml",
       "sh",
       "sql",
@@ -192,12 +207,24 @@ const getFileIconClass = (filePath) => {
   return "fa-regular fa-file";
 };
 
-const getTreeIconClass = (entryPath, entryType, expanded = false) => {
-  if (entryType === "directory") {
-    return expanded ? "fa-regular fa-folder-open" : "fa-regular fa-folder";
+const getDirectoryIconClass = (expanded = false) =>
+  expanded ? "fa-regular fa-folder-open" : "fa-regular fa-folder";
+
+const createFileVisualElement = (filePath, extraClass = "") => {
+  const badge = getBrandedFileBadge(filePath);
+  if (badge) {
+    const badgeElement = document.createElement("span");
+    badgeElement.className =
+      "file-type-badge " + badge.className + (extraClass ? " " + extraClass : "");
+    badgeElement.textContent = badge.label;
+    badgeElement.setAttribute("aria-hidden", "true");
+    return badgeElement;
   }
 
-  return getFileIconClass(entryPath);
+  return createIconElement(
+    getFileIconClass(filePath),
+    "file-icon" + (extraClass ? " " + extraClass : "")
+  );
 };
 
 const isExternalUrl = (value) =>
@@ -211,6 +238,10 @@ const createIconElement = (classes, extraClass = "") => {
 };
 
 const setStatus = (message, isError = false) => {
+  if (!elements.statusBar) {
+    return;
+  }
+
   elements.statusBar.textContent = message;
   elements.statusBar.style.background = isError
     ? "linear-gradient(90deg, #6d2432, #591a28)"
@@ -397,10 +428,9 @@ const renderFileEntries = (entries, depth, targetNode) => {
       );
     }
 
-    const icon = createIconElement(
-      getTreeIconClass(entry.path, entry.type, isExpanded),
-      "tree-icon"
-    );
+    const icon = isDirectory
+      ? createIconElement(getDirectoryIconClass(isExpanded), "tree-icon")
+      : createFileVisualElement(entry.path, "tree-icon");
 
     const name = document.createElement("span");
     name.className = "tree-name";
@@ -459,10 +489,7 @@ const renderTabs = () => {
       filePath === state.activeFilePath ? " active" : ""
     }`;
 
-    const icon = createIconElement(
-      getFileIconClass(filePath),
-      "editor-tab-icon"
-    );
+    const icon = createFileVisualElement(filePath, "editor-tab-icon");
 
     const name = document.createElement("span");
     name.className = "editor-tab-name";
@@ -714,43 +741,97 @@ const saveActiveFile = async () => {
   }
 };
 
-const invalidateCachesForChange = (changedPath) => {
-  if (!changedPath) {
+const invalidateCachesForChanges = (changedPaths) => {
+  const normalizedChanges = Array.isArray(changedPaths)
+    ? changedPaths.map((changedPath) => normalizePath(changedPath)).filter(Boolean)
+    : [];
+
+  if (normalizedChanges.length === 0 || normalizedChanges.length > 64) {
     state.directoryCache.clear();
     state.searchIndexRoot = "";
-    state.searchIndex = [];
+    state.searchIndexDirty = true;
     return;
   }
-
-  const normalizedChanged = normalizePath(changedPath);
 
   for (const cachePath of [...state.directoryCache.keys()]) {
     const normalizedCachePath = normalizePath(cachePath);
 
-    if (
-      normalizedCachePath === normalizedChanged ||
-      normalizedCachePath.startsWith(`${normalizedChanged}/`) ||
-      normalizedChanged.startsWith(`${normalizedCachePath}/`)
-    ) {
+    const shouldInvalidate = normalizedChanges.some(
+      (normalizedChanged) =>
+        normalizedCachePath === normalizedChanged ||
+        normalizedCachePath.startsWith(normalizedChanged + "/") ||
+        normalizedChanged.startsWith(normalizedCachePath + "/")
+    );
+
+    if (shouldInvalidate) {
       state.directoryCache.delete(cachePath);
     }
   }
 
   state.searchIndexRoot = "";
-  state.searchIndex = [];
+  state.searchIndexDirty = true;
 };
 
-const refreshVisibleTree = async () => {
+const collectRefreshDirectories = (changedPaths) => {
+  if (!state.rootPath) {
+    return [];
+  }
+
+  if (!Array.isArray(changedPaths) || changedPaths.length === 0) {
+    return [...state.expandedDirectories];
+  }
+
+  if (changedPaths.length > 64) {
+    return [...state.expandedDirectories];
+  }
+
+  const refreshTargets = new Set([state.rootPath]);
+  const normalizedRoot = normalizePath(state.rootPath);
+  const expandedDirectories = [...state.expandedDirectories];
+
+  changedPaths.forEach((changedPath) => {
+    const normalizedChanged = normalizePath(changedPath);
+    if (!normalizedChanged || !normalizedChanged.startsWith(normalizedRoot)) {
+      return;
+    }
+
+    expandedDirectories.forEach((directoryPath) => {
+      const normalizedDirectory = normalizePath(directoryPath);
+      if (
+        normalizedDirectory === normalizedChanged ||
+        normalizedDirectory.startsWith(normalizedChanged + "/") ||
+        normalizedChanged.startsWith(normalizedDirectory + "/")
+      ) {
+        refreshTargets.add(directoryPath);
+      }
+    });
+  });
+
+  return [...refreshTargets];
+};
+
+const refreshVisibleTree = async (directoriesToRefresh = null) => {
   if (!state.rootPath) {
     return;
   }
 
-  const expanded = [...state.expandedDirectories].sort((a, b) =>
+  const targetDirectories = Array.isArray(directoriesToRefresh)
+    ? directoriesToRefresh
+    : [...state.expandedDirectories];
+
+  const uniqueDirectories = [...new Set(targetDirectories)].sort((a, b) =>
     a.localeCompare(b)
   );
 
-  for (const directoryPath of expanded) {
+  for (const directoryPath of uniqueDirectories) {
     try {
+      if (
+        directoryPath !== state.rootPath &&
+        !state.expandedDirectories.has(directoryPath)
+      ) {
+        continue;
+      }
+
       await ensureDirectoryLoaded(directoryPath);
     } catch {
       state.expandedDirectories.delete(directoryPath);
@@ -761,15 +842,23 @@ const refreshVisibleTree = async () => {
   renderFileTree();
 };
 
-const scheduleTreeRefresh = () => {
+const queueWorkspaceRefreshForPath = (changedPath) => {
+  pendingWorkspaceChanges.add(changedPath || state.rootPath || "");
+
   if (treeRefreshTimer) {
     return;
   }
 
   treeRefreshTimer = setTimeout(() => {
     treeRefreshTimer = null;
-    void refreshVisibleTree();
-  }, 120);
+
+    const changedPaths = [...pendingWorkspaceChanges];
+    pendingWorkspaceChanges.clear();
+
+    invalidateCachesForChanges(changedPaths);
+    const refreshDirectories = collectRefreshDirectories(changedPaths);
+    void refreshVisibleTree(refreshDirectories);
+  }, 90);
 };
 
 const buildSearchIndex = async () => {
@@ -777,7 +866,7 @@ const buildSearchIndex = async () => {
     return [];
   }
 
-  if (state.searchIndexRoot === state.rootPath) {
+  if (state.searchIndexRoot === state.rootPath && !state.searchIndexDirty) {
     return state.searchIndex;
   }
 
@@ -801,6 +890,7 @@ const buildSearchIndex = async () => {
 
   state.searchIndexRoot = state.rootPath;
   state.searchIndex = files;
+  state.searchIndexDirty = false;
   return files;
 };
 
@@ -890,10 +980,7 @@ const renderSearchResults = () => {
       index === state.selectedSearchResult ? " active" : ""
     }`;
 
-    const icon = createIconElement(
-      getFileIconClass(filePath),
-      "search-result-icon"
-    );
+    const icon = createFileVisualElement(filePath, "search-result-icon");
 
     const text = document.createElement("span");
 
@@ -1006,7 +1093,10 @@ const loadTerminalProfiles = async () => {
 };
 
 const registerTerminalLinks = (xtermInstance) => {
-  if (!xtermInstance || typeof xtermInstance.registerLinkProvider !== "function") {
+  if (
+    !xtermInstance ||
+    typeof xtermInstance.registerLinkProvider !== "function"
+  ) {
     return;
   }
 
@@ -1249,7 +1339,9 @@ const createTerminalView = async ({
   }
 
   const selectedProfileId =
-    profileId || elements.terminalShellSelect.value || state.terminalProfiles[0].id;
+    profileId ||
+    elements.terminalShellSelect.value ||
+    state.terminalProfiles[0].id;
 
   const viewId = nextTerminalViewId;
   nextTerminalViewId += 1;
@@ -1474,6 +1566,7 @@ const openFolder = async (folderPath) => {
     state.openTabs = [];
     state.searchIndexRoot = "";
     state.searchIndex = [];
+    state.searchIndexDirty = false;
     state.searchResults = [];
     state.selectedSearchResult = 0;
 
@@ -1577,7 +1670,12 @@ const applyPlatformClass = () => {
 const setupEvents = () => {
   elements.activityButtons.forEach((button) => {
     button.addEventListener("click", () => {
-      setActivePanel(button.dataset.panel);
+      const panelId = button.dataset.panel;
+      if (!panelId) {
+        return;
+      }
+
+      setActivePanel(panelId);
     });
   });
 
@@ -1610,9 +1708,11 @@ const setupEvents = () => {
     void startTerminalProcessForView(activeView, { clear: true });
   });
 
-  elements.sidebarSettingsButton.addEventListener("click", () => {
-    setStatus("Settings panel coming soon.");
-  });
+  if (elements.sidebarSettingsButton) {
+    elements.sidebarSettingsButton.addEventListener("click", () => {
+      setActivePanel("extensions-pane");
+    });
+  }
 
   elements.searchInput.addEventListener("input", () => {
     void runSearch(elements.searchInput.value);
@@ -1708,33 +1808,38 @@ const setupEvents = () => {
   setupSplitter(elements.verticalSplitter, "vertical");
   setupSplitter(elements.terminalSplitter, "horizontal");
 
-  folderSelectionUnsubscribe = window.workbench.onFolderSelected((folderPath) => {
-    void openFolder(folderPath);
-  });
+  folderSelectionUnsubscribe = window.workbench.onFolderSelected(
+    (folderPath) => {
+      void openFolder(folderPath);
+    }
+  );
 
   saveRequestUnsubscribe = window.workbench.onSaveRequested(() => {
     void saveActiveFile();
   });
 
-  newTerminalRequestUnsubscribe = window.workbench.onNewTerminalRequested(() => {
-    void createTerminalView({ activate: true });
-  });
-
-  workspaceChangedUnsubscribe = window.workbench.onWorkspaceChanged((payload) => {
-    if (!state.rootPath || !payload || typeof payload.path !== "string") {
-      return;
+  newTerminalRequestUnsubscribe = window.workbench.onNewTerminalRequested(
+    () => {
+      void createTerminalView({ activate: true });
     }
+  );
 
-    const normalizedRoot = normalizePath(state.rootPath);
-    const normalizedPath = normalizePath(payload.path);
+  workspaceChangedUnsubscribe = window.workbench.onWorkspaceChanged(
+    (payload) => {
+      if (!state.rootPath || !payload || typeof payload.path !== "string") {
+        return;
+      }
 
-    if (!normalizedPath.startsWith(normalizedRoot)) {
-      return;
+      const normalizedRoot = normalizePath(state.rootPath);
+      const normalizedPath = normalizePath(payload.path);
+
+      if (!normalizedPath.startsWith(normalizedRoot)) {
+        return;
+      }
+
+      queueWorkspaceRefreshForPath(payload.path);
     }
-
-    invalidateCachesForChange(payload.path);
-    scheduleTreeRefresh();
-  });
+  );
 };
 
 const disposeAllTerminals = () => {
@@ -1831,6 +1936,8 @@ window.addEventListener("beforeunload", () => {
     clearTimeout(treeRefreshTimer);
     treeRefreshTimer = null;
   }
+
+  pendingWorkspaceChanges.clear();
 
   disposeAllTerminals();
   void window.workbench.unwatchWorkspace();

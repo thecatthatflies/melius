@@ -61,6 +61,15 @@
             >
               <i class="fa-solid fa-puzzle-piece" aria-hidden="true"></i>
             </button>
+            <button
+              id="sidebar-settings-button"
+              type="button"
+              class="activity-button activity-settings-button"
+              aria-label="Settings"
+              title="Settings"
+            >
+              <i class="fa-solid fa-gear" aria-hidden="true"></i>
+            </button>
           </nav>
 
           <aside id="side-panel" class="pane side-panel">
@@ -71,7 +80,9 @@
                     <i class="fa-regular fa-folder-open" aria-hidden="true"></i>
                     Explorer
                   </span>
-                  <span id="root-label" class="root-label">No folder opened</span>
+                  <span id="root-label" class="root-label"
+                    >No folder opened</span
+                  >
                 </div>
                 <div id="file-tree" class="file-tree"></div>
               </section>
@@ -126,17 +137,6 @@
               </section>
             </div>
 
-            <div class="sidebar-settings-bar">
-              <button
-                id="sidebar-settings-button"
-                class="sidebar-settings-button"
-                type="button"
-                aria-label="Settings"
-              >
-                <i class="fa-solid fa-gear" aria-hidden="true"></i>
-                <span>Settings</span>
-              </button>
-            </div>
           </aside>
 
           <div
@@ -148,6 +148,12 @@
           ></div>
 
           <section id="editor-stack" class="pane editor-stack">
+            <section id="editor-pane" class="pane editor-pane">
+              <div class="editor-header">
+                <div id="editor-tabs" class="editor-tabs"></div>
+              </div>
+              <div id="editor-container" class="editor-container"></div>
+            </section>
             <section id="terminal-pane" class="pane">
               <div class="pane-header terminal-pane-header">
                 <span class="pane-title">
@@ -188,13 +194,6 @@
               aria-label="Resize terminal"
               aria-orientation="horizontal"
             ></div>
-
-            <section id="editor-pane" class="pane editor-pane">
-              <div class="editor-header">
-                <div id="editor-tabs" class="editor-tabs"></div>
-              </div>
-              <div id="editor-container" class="editor-container"></div>
-            </section>
           </section>
         </section>
       </main>

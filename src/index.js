@@ -45,174 +45,34 @@ const createWorkspaceWatcherState = () => ({
   rootPath: "",
   watchers: new Map(),
   rebuildTimer: null,
+  recursiveWatcher: null,
+  usingRecursiveWatcher: false,
+  pendingProbePaths: new Set(),
+  probeTimer: null,
 });
 
-const getExtensionRuntimeState = (webContentsId) => {
-  if (!extensionRuntimesByWebContentsId.has(webContentsId)) {
-    extensionRuntimesByWebContentsId.set(
-      webContentsId,
-      createExtensionRuntimeState()
-    );
-  }
+const normalizeWatchPath = (value) => path.normalize(String(value || ""));
 
-  return extensionRuntimesByWebContentsId.get(webContentsId);
-};
+const isPathInWorkspace = (rootPath, candidatePath) => {
+  const normalizedRoot = normalizeWatchPath(rootPath);
+  const normalizedCandidate = normalizeWatchPath(candidatePath);
 
-const normalizeExternalUrl = (rawUrl) => {
-  if (typeof rawUrl !== "string") {
-    return "";
-  }
-
-  const trimmed = rawUrl.trim();
-  if (!trimmed) {
-    return "";
-  }
-
-  const withProtocol = /^www\./i.test(trimmed) ? `https://${trimmed}` : trimmed;
-
-  try {
-    const parsed = new URL(withProtocol);
-    if (!parsed || !["http:", "https:", "mailto:"].includes(parsed.protocol)) {
-      return "";
-    }
-
-    return parsed.toString();
-  } catch {
-    return "";
-  }
-};
-
-const openExternalUrl = async (rawUrl) => {
-  const normalized = normalizeExternalUrl(rawUrl);
-  if (!normalized) {
+  if (!normalizedRoot || !normalizedCandidate) {
     return false;
   }
 
-  try {
-    await shell.openExternal(normalized);
-    return true;
-  } catch {
-    return false;
-  }
+  return (
+    normalizedCandidate === normalizedRoot ||
+    normalizedCandidate.startsWith(normalizedRoot + path.sep)
+  );
 };
 
-const disposeEntry = async (entry) => {
-  if (!entry) {
+const emitWorkspaceChanged = (sender, changedPath) => {
+  if (sender.isDestroyed()) {
     return;
   }
 
-  if (typeof entry === "function") {
-    await Promise.resolve(entry());
-    return;
-  }
-
-  if (typeof entry.dispose === "function") {
-    await Promise.resolve(entry.dispose());
-  }
-};
-
-const disposeExtensionRuntime = async (runtime) => {
-  for (const disposable of runtime.disposables.splice(0)) {
-    try {
-      await disposeEntry(disposable);
-    } catch (error) {
-      console.error(`Failed disposing extension resource: ${error.message}`);
-    }
-  }
-
-  runtime.commands.clear();
-  runtime.extensions = [];
-  runtime.workspacePath = "";
-};
-
-const serializeExtensionRuntime = (runtime) => ({
-  workspacePath: runtime.workspacePath,
-  extensions: runtime.extensions.map((extension) => ({
-    ...extension,
-    commands: Array.isArray(extension.commands) ? extension.commands : [],
-  })),
-  commands: [...runtime.commands.values()].map((command) => ({
-    id: command.id,
-    title: command.title,
-    extensionId: command.extensionId,
-  })),
-});
-
-const sanitizeExtensionId = (rawValue) => {
-  const sanitized = String(rawValue || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-
-  return sanitized;
-};
-
-const formatExtensionName = (extensionId) =>
-  extensionId
-    .split(/[._-]/g)
-    .filter(Boolean)
-    .map((part) => part[0].toUpperCase() + part.slice(1))
-    .join(" ") || "Untitled Extension";
-
-const coerceManifestCommands = (rawCommands, extensionId) => {
-  if (!Array.isArray(rawCommands)) {
-    return [];
-  }
-
-  return rawCommands
-    .map((item, index) => {
-      if (typeof item === "string") {
-        const commandId = item.trim();
-        if (!commandId) {
-          return null;
-        }
-
-        return {
-          id: commandId,
-          title: commandId,
-        };
-      }
-
-      if (!item || typeof item !== "object") {
-        return null;
-      }
-
-      const suggestedId =
-        typeof item.id === "string" && item.id.trim()
-          ? item.id.trim()
-          : `${extensionId}.command${index + 1}`;
-
-      return {
-        id: suggestedId,
-        title:
-          typeof item.title === "string" && item.title.trim()
-            ? item.title.trim()
-            : suggestedId,
-      };
-    })
-    .filter(Boolean);
-};
-
-const listDirectory = async (directoryPath) => {
-  const entries = await fs.readdir(directoryPath, { withFileTypes: true });
-  return entries
-    .filter((entry) => !entry.isSymbolicLink())
-    .map((entry) => ({
-      name: entry.name,
-      path: path.join(directoryPath, entry.name),
-      type: entry.isDirectory() ? "directory" : "file",
-    }))
-    .sort((left, right) => {
-      if (left.type !== right.type) {
-        return left.type === "directory" ? -1 : 1;
-      }
-
-      return left.name.localeCompare(right.name, undefined, {
-        numeric: true,
-        sensitivity: "base",
-      });
-    });
+  sender.send("workspace:changed", { path: changedPath });
 };
 
 const closeWorkspaceWatchState = (watchState) => {
@@ -225,6 +85,22 @@ const closeWorkspaceWatchState = (watchState) => {
     watchState.rebuildTimer = null;
   }
 
+  if (watchState.probeTimer) {
+    clearTimeout(watchState.probeTimer);
+    watchState.probeTimer = null;
+  }
+
+  watchState.pendingProbePaths.clear();
+
+  if (watchState.recursiveWatcher) {
+    try {
+      watchState.recursiveWatcher.close();
+    } catch {
+      // Ignore close errors.
+    }
+    watchState.recursiveWatcher = null;
+  }
+
   for (const watcher of watchState.watchers.values()) {
     try {
       watcher.close();
@@ -234,6 +110,7 @@ const closeWorkspaceWatchState = (watchState) => {
   }
 
   watchState.watchers.clear();
+  watchState.usingRecursiveWatcher = false;
   watchState.rootPath = "";
 };
 
@@ -248,7 +125,12 @@ const stopWatchingWorkspace = (webContentsId) => {
 };
 
 const scheduleWorkspaceWatcherRebuild = (watchState, sender) => {
-  if (!watchState || !watchState.rootPath || sender.isDestroyed()) {
+  if (
+    !watchState ||
+    !watchState.rootPath ||
+    sender.isDestroyed() ||
+    watchState.usingRecursiveWatcher
+  ) {
     return;
   }
 
@@ -259,7 +141,11 @@ const scheduleWorkspaceWatcherRebuild = (watchState, sender) => {
   watchState.rebuildTimer = setTimeout(() => {
     watchState.rebuildTimer = null;
 
-    if (sender.isDestroyed() || !watchState.rootPath) {
+    if (
+      sender.isDestroyed() ||
+      !watchState.rootPath ||
+      watchState.usingRecursiveWatcher
+    ) {
       return;
     }
 
@@ -272,21 +158,131 @@ const scheduleWorkspaceWatcherRebuild = (watchState, sender) => {
     }
 
     watchState.watchers.clear();
-
-    void scanAndWatchDirectories(watchState, sender);
-  }, 220);
+    void scanAndWatchDirectories(watchState, sender, watchState.rootPath);
+  }, 500);
 };
 
-const scanAndWatchDirectories = async (watchState, sender) => {
-  if (!watchState || !watchState.rootPath || sender.isDestroyed()) {
+const queueWatchPathProbe = (watchState, sender, changedPath) => {
+  if (
+    !watchState ||
+    watchState.usingRecursiveWatcher ||
+    !changedPath ||
+    sender.isDestroyed()
+  ) {
     return;
   }
 
-  const stack = [watchState.rootPath];
+  watchState.pendingProbePaths.add(changedPath);
 
-  while (stack.length > 0 && !sender.isDestroyed()) {
+  if (watchState.probeTimer) {
+    return;
+  }
+
+  watchState.probeTimer = setTimeout(() => {
+    watchState.probeTimer = null;
+
+    if (sender.isDestroyed() || !watchState.rootPath || watchState.usingRecursiveWatcher) {
+      watchState.pendingProbePaths.clear();
+      return;
+    }
+
+    const probePaths = [...watchState.pendingProbePaths];
+    watchState.pendingProbePaths.clear();
+
+    void (async () => {
+      for (const probePath of probePaths) {
+        if (!isPathInWorkspace(watchState.rootPath, probePath)) {
+          continue;
+        }
+
+        try {
+          const stat = await fs.stat(probePath);
+          if (stat.isDirectory()) {
+            await scanAndWatchDirectories(watchState, sender, probePath);
+          }
+        } catch {
+          // Ignore transient filesystem race conditions.
+        }
+      }
+    })();
+  }, 140);
+};
+
+const startRecursiveWorkspaceWatcher = (watchState, sender) => {
+  if (!watchState || !watchState.rootPath || sender.isDestroyed()) {
+    return false;
+  }
+
+  if (!["darwin", "win32"].includes(process.platform)) {
+    return false;
+  }
+
+  try {
+    const watcher = fsNative.watch(
+      watchState.rootPath,
+      { persistent: false, recursive: true },
+      (_eventType, fileName) => {
+        const changedPath = fileName
+          ? path.join(watchState.rootPath, String(fileName))
+          : watchState.rootPath;
+
+        emitWorkspaceChanged(sender, changedPath);
+      }
+    );
+
+    watcher.on("error", () => {
+      if (watchState.recursiveWatcher === watcher) {
+        watchState.recursiveWatcher = null;
+      }
+      watchState.usingRecursiveWatcher = false;
+
+      try {
+        watcher.close();
+      } catch {
+        // Ignore close errors.
+      }
+
+      if (!sender.isDestroyed() && watchState.rootPath) {
+        void scanAndWatchDirectories(watchState, sender, watchState.rootPath);
+      }
+    });
+
+    watchState.recursiveWatcher = watcher;
+    watchState.usingRecursiveWatcher = true;
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const scanAndWatchDirectories = async (
+  watchState,
+  sender,
+  startPath = watchState?.rootPath
+) => {
+  if (
+    !watchState ||
+    !watchState.rootPath ||
+    sender.isDestroyed() ||
+    watchState.usingRecursiveWatcher
+  ) {
+    return;
+  }
+
+  const normalizedStartPath = startPath ? path.normalize(startPath) : null;
+  if (!normalizedStartPath || !isPathInWorkspace(watchState.rootPath, normalizedStartPath)) {
+    return;
+  }
+
+  const stack = [normalizedStartPath];
+
+  while (stack.length > 0 && !sender.isDestroyed() && !watchState.usingRecursiveWatcher) {
     const directoryPath = stack.pop();
     if (!directoryPath || watchState.watchers.has(directoryPath)) {
+      continue;
+    }
+
+    if (!isPathInWorkspace(watchState.rootPath, directoryPath)) {
       continue;
     }
 
@@ -303,8 +299,8 @@ const scanAndWatchDirectories = async (watchState, sender) => {
             ? path.join(directoryPath, String(fileName))
             : directoryPath;
 
-          sender.send("workspace:changed", { path: changedPath });
-          scheduleWorkspaceWatcherRebuild(watchState, sender);
+          emitWorkspaceChanged(sender, changedPath);
+          queueWatchPathProbe(watchState, sender, changedPath);
         }
       );
 
@@ -351,7 +347,10 @@ const watchWorkspaceForSender = async (sender, workspacePath) => {
   watchState.rootPath = normalizedWorkspacePath;
 
   workspaceWatchersByWebContentsId.set(senderId, watchState);
-  await scanAndWatchDirectories(watchState, sender);
+
+  if (!startRecursiveWorkspaceWatcher(watchState, sender)) {
+    await scanAndWatchDirectories(watchState, sender, normalizedWorkspacePath);
+  }
 
   return {
     watching: true,
@@ -533,7 +532,6 @@ const resolveScriptFallback = (profile) => {
 
   return null;
 };
-
 
 const dedupeShellProfiles = (profiles) => {
   const seen = new Set();

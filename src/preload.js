@@ -28,7 +28,8 @@ contextBridge.exposeInMainWorld("workbench", {
   onWorkspaceChanged: (callback) => subscribe("workspace:changed", callback),
 
   getInitialCwd: () => ipcRenderer.invoke("app:getCwd"),
-  openExternal: (targetUrl) => ipcRenderer.invoke("app:openExternal", targetUrl),
+  openExternal: (targetUrl) =>
+    ipcRenderer.invoke("app:openExternal", targetUrl),
 
   listTerminalProfiles: () => ipcRenderer.invoke("terminal:listProfiles"),
   createTerminalSession: (options) =>
